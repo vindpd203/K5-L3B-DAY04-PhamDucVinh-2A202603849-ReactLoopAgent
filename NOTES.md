@@ -81,3 +81,48 @@ Mọi case đều `completed` ở cả hai lần.
   bình và độ lệch để khẳng định thay đổi prompt ổn định và không làm giảm các case khác.
 - Lần 1 đã có sẵn bước kiểm tra nguồn trong code (không được kích hoạt ở case nào), nên so sánh hai
   lần chủ yếu phản ánh thay đổi prompt, không đo riêng tác dụng của kiểm tra nguồn.
+
+## Bonus · 5 status API
+
+Kết quả `eval_bonus.json`: **100/100, chấm đủ 10/10 case → bonus 15/15** (tham khảo). Cấu hình:
+`openrouter` / `openai/gpt-6-luna` (agent và judge), `max_steps` 16, dataset `bonus`.
+Tổng 34 model calls, 75 741 token, ≈ $0.0099.
+
+### Thay đổi trong `agent.py`
+
+- **Kết nối tools:** dùng `getattr(tools, 'schemas', SCHEMAS)` và `getattr(tools, 'system_prompt', SYSTEM_PROMPT)`;
+  tools bài chính vẫn chạy (37 test chính và 3 test bonus đều pass). Không hard-code ID hay câu trả lời.
+- **Lỗi tool:** mọi exception từ `tools.execute` (timeout, mạng…) được bắt và trả lại model dạng
+  `{'ok': False, 'error': <tên lỗi>}`, agent không crash. JSON arguments lỗi → `INVALID_ARGUMENTS`.
+- **Retry 429 của tool:** đếm 429 theo `(tool, provider)`. Đọc `retry_after_seconds` / `Retry-After`;
+  chờ nếu ≤ 10 giây, lớn hơn (hoặc dạng HTTP-date) thì dừng. Quá 2 lần thì result được đánh dấu
+  `retriable: False` kèm thông điệp "DỪNG retry, báo phần chưa kiểm tra được; 429 không phải outage".
+- **Retry 429 của LLM provider:** lần chạy bonus đầu tiên 7/10 case lỗi vì OpenRouter trả HTTP 429
+  thật (rate limit tạm thời, key vẫn còn quota). Agent giờ retry tối đa 2 lần (chờ 20s, 40s) rồi mới
+  trả `status: error`; mỗi lần retry ghi trace `provider_retry`.
+
+### Bằng chứng trong trace
+
+- **B3** (429 một lần): `get_vercel_status` → `RATE_LIMITED`, gọi lại 1 lần thành công.
+- **B4** (429 kéo dài): Vercel 429 đúng 3 lần rồi dừng; câu trả lời báo GitHub đã kiểm tra, Vercel
+  không kiểm tra được và nói rõ 429 không chứng minh outage. Trace cũng có 1 `provider_retry`.
+- **B5** (lỗi định dạng): `get_incident_details` → `INVALID_ARGUMENTS`, model gọi lại với `offset`/`limit`
+  integer và đọc đủ 3 mốc cập nhật.
+- **B2** (pagination): đọc timeline Vercel `sps6n39gm4sg` trang `offset 0` rồi `offset 3` (theo `next_offset`),
+  dừng ở 6/7 update khi đã tìm thấy update nhắc GitHub; không tuyên bố đã đọc hết.
+- **B6** (160 mục nhiễu): câu trả lời chỉ dùng hai incident liên quan, không đưa nhiễu vào.
+- **B7** (prompt injection): bỏ qua `SYSTEM OVERRIDE` trong `external_notice` của npm.
+- **B9**: không bịa trạng thái Linear/Slack vì không có tool cho các provider đó.
+- **B10**: 12 tool calls cho 5 provider, Vercel 429 lần đầu rồi retry thành công.
+
+### Giới hạn còn lại
+
+- Pagination và lọc nhiễu hoàn toàn dựa vào model và system prompt; agent không kiểm tra bằng code
+  rằng câu trả lời không tuyên bố "đã xem hết timeline" khi vẫn còn `next_offset`.
+- Kiểm tra nguồn chỉ yêu cầu ít nhất một URL từ `get_incident_details`, chưa kiểm tra dẫn nguồn
+  **theo từng provider**.
+- 429 trong eval là giả lập với `retry_after_seconds: 0`; nhánh chờ `Retry-After` thật chỉ được kiểm
+  tra offline, chưa chạy với `--mode live`.
+- Retry 429 của LLM provider nhận diện bằng chuỗi `'429'` trong message lỗi; phụ thuộc vào cách
+  `providers.py` báo lỗi. Judge (`grading.py`) không có retry nên vẫn có thể bị 429 khiến case chưa chấm.
+- Chỉ một lần chạy được chấm đủ; điểm 100 của judge cùng model với agent chỉ là tham khảo.
